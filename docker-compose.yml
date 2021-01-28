@@ -1,0 +1,140 @@
+# Dockerfiles for the Docker images are in another Git repo:
+# https://github.com/debiki/talkyard, at: images/(image-name)/Dockerfile
+#
+# There's an image build script: https://github.com/debiki/talkyard/blob/master/Makefile,
+# the `prod-images` and `tag-and-push-latest-images` targets.
+
+version: '3.7'
+
+networks:
+  # This netw name get prefixed with COMPOSE_PROJECT_NAME  = 'talkyard_' by Docker, from .env.
+  internal_net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: ${INTERNAL_NET_SUBNET}
+
+services:
+  web:
+    image: ${DOCKER_REPOSITORY}/talkyard-web:${VERSION_TAG}
+    # dockerfile: https://github.com/debiki/talkyard/blob/master/images/web/Dockerfile
+    restart: always
+    volumes:
+      - ./conf/sites-enabled-manual/:/etc/nginx/sites-enabled-manual/:ro
+      - ./data/sites-enabled-auto-gen/:/etc/nginx/sites-enabled-auto-gen/:ro
+      - ./data/certbot/:/etc/certbot/:ro
+      - ./data/certbot-challenges/.well-known/:/opt/nginx/html/.well-known/:ro
+      - ./data/uploads/:/opt/talkyard/uploads/:ro
+      # Mount here so standard monitoring tools looking for Nginx logs will work.
+      - /var/log/nginx/:/var/log/nginx/
+    ports:
+      - '80:80'
+      - '443:443'
+    networks:
+      internal_net:
+        ipv4_address: ${INTERNAL_NET_WEB_IP}
+    depends_on:
+      - app
+    #environment:
+    #  # Max uploaded file size, e.g. uploaded images or backups to restore:
+    #  TY_NGX_LIMIT_REQ_BODY_SIZE: '25m'
+    #  X_PULL_KEY: '...'
+    #  CDN_PULL_KEY: '...'
+    #
+    # SECURITY COULD drop capabilities, see: http://rhelblog.redhat.com/2016/10/17/secure-your-containers-with-this-one-weird-trick/
+    # Ask at Hacker News: which caps can I drop for an Nginx container? A JVM appserver?
+    # Asked here about Nginx:
+    #   https://stackoverflow.com/questions/43467670/which-capabilities-can-i-drop-in-a-docker-nginx-container
+    # For all containers, not just 'web'.
+    #cap_drop:
+    #  - DAC_OVERRIDE
+    #  ... many more?
+
+  app:
+    image: ${DOCKER_REPOSITORY}/talkyard-app:${VERSION_TAG}
+    # dockerfile: https://github.com/debiki/talkyard/blob/master/images/app/Dockerfile.prod
+    restart: always
+    stdin_open: true  # otherwise Play Framework exits
+    volumes:
+      - ./conf/play-framework.conf:/opt/talkyard/app/conf/app-prod-override.conf:ro  # see [4WDKPU2] in debiki/talkyard
+      - ./data/uploads/:/opt/talkyard/uploads/
+      # So backups can be downloaded via the admin web interface. But read-only,
+      # so evil bugs cannot destroy all backups.
+      - /opt/talkyard-backups/:/opt/talkyard-backups/:ro
+      # Mount here so log monitoring agents like fluentd can access the log.
+      - /var/log/talkyard/:/var/log/talkyard/
+    networks:
+      internal_net:
+        ipv4_address: ${INTERNAL_NET_APP_IP}
+    depends_on:
+      - cache
+      - rdb
+      - search
+    environment:
+      - PLAY_SECRET_KEY
+      - TALKYARD_SECURE
+      - POSTGRES_PASSWORD
+      - TALKYARD_HOSTNAME
+      - BECOME_OWNER_EMAIL_ADDRESS
+
+  cache:
+    image: ${DOCKER_REPOSITORY}/talkyard-cache:${VERSION_TAG}
+    # dockerfile: https://github.com/debiki/talkyard/blob/master/images/cache/Dockerfile
+    restart: always
+    volumes:
+      - ./data/cache/:/data/
+      - /var/log/redis/:/var/log/redis/
+    networks:
+      internal_net:
+        ipv4_address: ${INTERNAL_NET_CACHE_IP}
+    sysctls:
+      net.core.somaxconn: 511
+
+  rdb:
+    image: ${DOCKER_REPOSITORY}/talkyard-rdb:${VERSION_TAG}
+    # dockerfile: https://github.com/debiki/talkyard/blob/master/images/rdb/Dockerfile
+    restart: always
+    volumes:
+      - ./data/rdb/:/var/lib/postgresql/data/
+      # Mount here so standard monitoring tools configured to find Postgres logs here will work.
+      # (Inside the container, we don't mount in /var/lib/postgresql/data/pg_log/ because
+      # then Postgres would refuse to create a db in data/, because data/ wouldn't be empty.)
+      - /var/log/postgresql/:/var/log/postgresql/
+    networks:
+      internal_net:
+        ipv4_address: ${INTERNAL_NET_RDB_IP}
+    environment:
+      POSTGRES_PASSWORD: '$POSTGRES_PASSWORD'
+      # Optionally, streaming replication peer:
+      # (but you'll need to rename ./postgres-data/recovery.conf.disabled first — and
+      # that file isn't created until you start Postgres)
+      # PEER_HOST: 'postgres2'
+      # PEER_PORT: '5432'
+      # PEER_PASSWORD: '...'
+
+  search:
+    image: ${DOCKER_REPOSITORY}/talkyard-search:${VERSION_TAG}
+    # dockerfile: https://github.com/debiki/talkyard/blob/master/images/search/Dockerfile
+    restart: always
+    volumes:
+      # COULD_OPTIMIZE Maybe use a Docker volume contanier here instead? What does the docs mean when
+      # they say "Always use a volume bound on /usr/share/elasticsearch/data" — is mapping
+      # a directory from the OS okay then? (that's using (parts of) a host's device/volume.
+      # https://www.elastic.co/guide/en/elasticsearch/reference/5.5/docker.html#docker-cli-run-prod-mode
+      - ./data/search/:/usr/share/elasticsearch/data/
+      - /var/log/elasticsearch/:/usr/share/elasticsearch/logs/
+    networks:
+      internal_net:
+        ipv4_address: ${INTERNAL_NET_SEARCH_IP}
+    environment:
+      bootstrap.memory_lock: 'true'
+      ES_JAVA_OPTS: '-Xms512m -Xmx512m'
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+      nofile:
+        soft: 65536
+        hard: 65536
+
+# vim: et ts=2 sw=2
